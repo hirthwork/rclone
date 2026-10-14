@@ -1,15 +1,19 @@
 package operations
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"slices"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,12 +31,14 @@ var errorTestError = errors.New("test error")
 // this is a wrapper for a mockobject with a custom Open function
 //
 // breaks indicate the number of bytes to read before returning an
-// error
+// error and garbage the number of bytes of garbage to return just
+// before each error
 type reOpenTestObject struct {
 	fs.Object
 	t           *testing.T
 	wantStart   int64
 	breaks      []int64
+	garbage     []int64
 	unknownSize bool
 }
 
@@ -72,13 +78,22 @@ func (o *reOpenTestObject) Open(ctx context.Context, options ...fs.OpenOption) (
 		// Pop a breakpoint off
 		N := o.breaks[0]
 		o.breaks = o.breaks[1:]
-		o.wantStart += N
+		// and the amount of garbage to send before the error
+		var G int64
+		if len(o.garbage) > 0 {
+			G = o.garbage[0]
+			o.garbage = o.garbage[1:]
+		}
+		// The stream is reopened reopenRewind bytes before the error
+		// but not before where it was opened
+		o.wantStart += max(N+G-reopenRewind, 0)
 		// If 0 then return an error immediately
 		if N == 0 {
 			return nil, errorTestError
 		}
-		// Read N bytes then an error
-		r := io.MultiReader(&io.LimitedReader{R: rc, N: N}, readers.ErrorReader{Err: errorTestError})
+		// Read N bytes then G bytes of garbage then an error
+		garbage := bytes.Repeat([]byte{0xFF}, int(G))
+		r := io.MultiReader(&io.LimitedReader{R: rc, N: N}, bytes.NewReader(garbage), readers.ErrorReader{Err: errorTestError})
 		// Wrap with Close in a new readCloser
 		rc = readCloser{Reader: r, Closer: rc}
 	}
@@ -211,10 +226,11 @@ func TestReOpen(t *testing.T) {
 				h, _, err := testReOpen([]int64{2, 1, 3}, 3)
 				assert.NoError(t, err)
 
-				// check contents
+				// check contents - the data read before each error is
+				// discarded in case it is garbage
 				got, err := io.ReadAll(h)
 				assert.Equal(t, errorTestError, err)
-				assert.Equal(t, expectedRead[:6], got)
+				assert.Equal(t, expectedRead[:0], got)
 
 				// check old error is returned
 				var buf = make([]byte, 1)
@@ -350,7 +366,8 @@ func TestReOpen(t *testing.T) {
 			})
 
 			t.Run("AccountRead", func(t *testing.T) {
-				h, _, err := testReOpen(nil, 10)
+				// Use breaks to check discarded data isn't accounted
+				h, _, err := testReOpen([]int64{2, 1, 3}, 10)
 				assert.NoError(t, err)
 
 				var total int
@@ -426,4 +443,96 @@ func TestReOpen(t *testing.T) {
 			})
 		})
 	}
+}
+
+// readReOpenInChunks reads all of h in chunks of bufSize bytes,
+// checking the position reported by Seek matches the data returned
+func readReOpenInChunks(t *testing.T, h *ReOpen, bufSize int) []byte {
+	var got []byte
+	buf := make([]byte, bufSize)
+	for {
+		n, err := h.Read(buf)
+		got = append(got, buf[:n]...)
+		pos, seekErr := h.Seek(0, io.SeekCurrent)
+		require.NoError(t, seekErr)
+		assert.Equal(t, int64(len(got)), pos)
+		if err == io.EOF {
+			return got
+		}
+		require.NoError(t, err)
+	}
+}
+
+// Check garbage sent just before the stream breaks is discarded and
+// the stream reopened reopenRewind bytes before the break, whatever
+// size of buffer the data is read with.
+func TestReOpenGarbage(t *testing.T) {
+	contents := []byte(random.String(3*reopenRewind + 123))
+	for _, test := range []struct {
+		name    string
+		breaks  []int64
+		garbage []int64
+		rng     *fs.RangeOption
+	}{
+		{name: "NoGarbage", breaks: []int64{5000, 100, 6000}},
+		{name: "MaxGarbage", breaks: []int64{5000, 100, 6000}, garbage: []int64{reopenRewind, reopenRewind, reopenRewind}},
+		{name: "SomeGarbage", breaks: []int64{5000, 100, 6000, 500}, garbage: []int64{1, 50, 4000, 0}},
+		{name: "RangeGarbage", breaks: []int64{5000, 100}, garbage: []int64{reopenRewind, 50}, rng: &fs.RangeOption{Start: 1000, End: int64(len(contents)) - 1001}},
+	} {
+		for _, bufSize := range []int{1, 100, reopenRewind, 2 * len(contents)} {
+			t.Run(fmt.Sprintf("%s/%d", test.name, bufSize), func(t *testing.T) {
+				src := &reOpenTestObject{
+					Object:  mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
+					t:       t,
+					breaks:  slices.Clone(test.breaks),
+					garbage: slices.Clone(test.garbage),
+				}
+				// Hashes can only be requested when reading from the start
+				want := contents
+				opts := []fs.OpenOption{&fs.HashesOption{Hashes: hash.NewHashSet(hash.MD5)}}
+				if test.rng != nil {
+					opts = []fs.OpenOption{test.rng}
+					src.wantStart = test.rng.Start
+					want = contents[test.rng.Start : test.rng.End+1]
+				}
+				h, err := NewReOpen(context.Background(), src, 10, opts...)
+				require.NoError(t, err)
+				got := readReOpenInChunks(t, h, bufSize)
+				assert.Equal(t, want, got)
+				assert.Empty(t, src.breaks, "not all breaks were hit")
+				assert.NoError(t, h.Close())
+			})
+		}
+	}
+
+	// Check only the data more than reopenRewind bytes before the
+	// break is returned when the retries run out
+	t.Run("TooManyErrors", func(t *testing.T) {
+		src := &reOpenTestObject{
+			Object:  mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
+			t:       t,
+			breaks:  []int64{5000},
+			garbage: []int64{100},
+		}
+		h, err := NewReOpen(context.Background(), src, 1)
+		require.NoError(t, err)
+		got, err := io.ReadAll(h)
+		assert.Equal(t, errorTestError, err)
+		assert.Equal(t, contents[:5100-reopenRewind], got)
+	})
+
+	// Check an error after all the data has been read is returned
+	// rather than retried as it can't be a truncation
+	t.Run("ErrorAtEnd", func(t *testing.T) {
+		src := &reOpenTestObject{
+			Object: mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
+			t:      t,
+			breaks: []int64{int64(len(contents))},
+		}
+		h, err := NewReOpen(context.Background(), src, 10)
+		require.NoError(t, err)
+		got, err := io.ReadAll(h)
+		assert.Equal(t, errorTestError, err)
+		assert.Equal(t, contents[:len(got)], got)
+	})
 }

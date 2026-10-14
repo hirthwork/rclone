@@ -10,6 +10,9 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 )
 
+// Number of bytes to discard from the end of the last chunk if stream breaks.
+const reopenRewind = 4 * 1024
+
 // AccountFn is a function which will be called after every read
 // from the ReOpen.
 //
@@ -31,6 +34,8 @@ type ReOpen struct {
 	end         int64           // absolute position to end reading (exclusive)
 	offset      int64           // offset in the file we are at, offset from start
 	newOffset   int64           // if different to offset, reopen needed
+	streamRead  int64           // number of bytes read from rc since it was opened
+	held        []byte          // data read from rc beyond offset, not yet returned by Read
 	maxTries    int             // maximum number of retries
 	tries       int             // number of retries we've had so far in this stream
 	err         error           // if this is set then Read/Close calls will return it
@@ -67,6 +72,7 @@ func NewReOpen(ctx context.Context, src fs.Object, maxTries int, options ...fs.O
 		start:       0,
 		offset:      0,
 		newOffset:   -1, // -1 means no seek required
+		held:        make([]byte, 0, reopenRewind),
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -154,6 +160,7 @@ func (h *ReOpen) open() error {
 		return h.err
 	}
 	h.opened = true
+	h.streamRead = 0
 	return nil
 }
 
@@ -196,6 +203,7 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 		if h.offset != h.newOffset {
 			fs.DebugfCtx(h.ctx, h.src, "Seek from %d to %d", h.offset, h.newOffset)
 			h.offset = h.newOffset
+			h.held = h.held[:0]
 			err = h.reopen()
 			if err != nil {
 				return 0, err
@@ -204,22 +212,50 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 		h.newOffset = -1
 	}
 
-	// Read a full buffer
+	// return held data first
+	n = min(len(p), len(h.held))
+	for i := range n {
+		p[i] = h.held[i]
+	}
+	h.held = append(h.held[:0], h.held[n:]...)
 	startOffset := h.offset
-	var nn int
-	for n < len(p) && err == nil {
-		nn, err = h.rc.Read(p[n:])
-		n += nn
-		h.offset += int64(nn)
+	h.offset += int64(n)
+
+	// Read a full buffer
+	for err == nil && (n < len(p) || len(h.held) < reopenRewind) {
+		var nn int
+		if n < len(p) {
+			nn, err = h.rc.Read(p[n:])
+			n += nn
+			h.offset += int64(nn)
+		} else {
+			nn, err = h.rc.Read(h.held[len(h.held):reopenRewind])
+			h.held = h.held[:len(h.held)+nn]
+		}
+		h.streamRead += int64(nn)
 		if err != nil && err != io.EOF {
 			h.err = err
-			if !fserrors.IsNoLowLevelRetryError(err) {
-				fs.DebugfCtx(h.ctx, h.src, "Reopening on read failure after offset %d bytes: retry %d/%d: %v", h.offset, h.tries, h.maxTries, err)
+			readTo := h.offset + int64(len(h.held))
+			if h.start+readTo != h.end && !fserrors.IsNoLowLevelRetryError(err) {
+				// Discard the end of the broken stream as it may be garbage.
+				// h.held must be discarded completely.
+				// Tail of p must be discarded as well.
+				discard := int(min(h.streamRead, reopenRewind, int64(n+len(h.held))))
+				fs.DebugfCtx(h.ctx, h.src, "Reopening on read failure after offset %d bytes discarding the last %d bytes: retry %d/%d: %v", readTo, discard, h.tries, h.maxTries, err)
+				fromP := discard - len(h.held)
+				n -= fromP
+				h.offset -= int64(fromP)
+				h.held = h.held[:0]
 				if h.reopen() == nil {
 					err = nil
 				}
 			}
 		}
+	}
+	// Only return EOF with a short read so that any held back data
+	// is returned by a later Read first
+	if err == io.EOF && n == len(p) {
+		err = nil
 	}
 	// Count a read of the data if we read from the start successfully
 	if startOffset == 0 && n != 0 {
