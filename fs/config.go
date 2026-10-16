@@ -193,6 +193,11 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Number of low level retries to do",
 	Groups:  "Config",
 }, {
+	Name:    "download_rewind",
+	Default: SizeSuffix(0),
+	Help:    "Discard and re-read this much data when a download is interrupted",
+	Groups:  "Config",
+}, {
 	Name:     "update",
 	ShortOpt: "u",
 	Default:  false,
@@ -613,6 +618,7 @@ type ConfigInfo struct {
 	Retries                    int               `config:"retries"`                // High-level retries
 	RetriesInterval            Duration          `config:"retries_sleep"`
 	LowLevelRetries            int               `config:"low_level_retries"`
+	DownloadRewind             SizeSuffix        `config:"download_rewind"`
 	UpdateOlder                bool              `config:"update"`           // Skip files that are newer on the destination
 	NoGzip                     bool              `config:"no_gzip_encoding"` // Disable compression
 	MaxDepth                   int               `config:"max_depth"`

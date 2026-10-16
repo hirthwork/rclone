@@ -610,6 +610,17 @@ See [AWS Docs on Data Integrity Protections](https://docs.aws.amazon.com/sdkref/
 			Default:  fs.Tristate{},
 			Advanced: true,
 		}, {
+			Name: "skip_insufficient_storage",
+			Help: `If set, skip objects the server returns 507 Insufficient Storage for.
+
+Some faulty servers return HTTP 507 when they have lost the data of
+an object. By default rclone treats this like any other failure and
+tries the object again on each high level retry. With this set the
+object is logged as an error and not retried, so the rest of the
+transfer carries on without it.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     "versions",
 			Help:     "Include old versions in directory listings.",
 			Default:  false,
@@ -1124,6 +1135,7 @@ type Options struct {
 	UseMultipartEtag            fs.Tristate          `config:"use_multipart_etag"`
 	UsePresignedRequest         bool                 `config:"use_presigned_request"`
 	UseDataIntegrityProtections fs.Tristate          `config:"use_data_integrity_protections"`
+	SkipInsufficientStorage     bool                 `config:"skip_insufficient_storage"`
 	Versions                    bool                 `config:"versions"`
 	VersionAt                   fs.Time              `config:"version_at"`
 	VersionDeleted              bool                 `config:"version_deleted"`
@@ -4516,8 +4528,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 	}
 	if err != nil {
-		if statusCode := getHTTPStatusCode(err); statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed {
+		statusCode := getHTTPStatusCode(err)
+		if statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed {
 			return nil, fs.ErrorObjectNotFound
+		}
+		if statusCode == http.StatusInsufficientStorage && o.fs.opt.SkipInsufficientStorage {
+			return nil, fserrors.NoRetryError(fmt.Errorf("skipping object as the server has lost its data: %w", err))
 		}
 		return nil, err
 	}

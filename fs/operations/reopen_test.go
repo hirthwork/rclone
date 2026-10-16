@@ -28,15 +28,27 @@ var (
 
 var errorTestError = errors.New("test error")
 
+// testRewind is the --download-rewind most of the tests run with
+const testRewind = 4 * 1024
+
+// rewindContext returns a context with --download-rewind set to rewind
+func rewindContext(rewind int64) context.Context {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.DownloadRewind = fs.SizeSuffix(rewind)
+	return ctx
+}
+
 // this is a wrapper for a mockobject with a custom Open function
 //
 // breaks indicate the number of bytes to read before returning an
 // error and garbage the number of bytes of garbage to return just
-// before each error
+// before each error. rewind is the --download-rewind in use, which
+// decides where the stream is expected to be reopened.
 type reOpenTestObject struct {
 	fs.Object
 	t           *testing.T
 	wantStart   int64
+	rewind      int64
 	breaks      []int64
 	garbage     []int64
 	unknownSize bool
@@ -84,9 +96,9 @@ func (o *reOpenTestObject) Open(ctx context.Context, options ...fs.OpenOption) (
 			G = o.garbage[0]
 			o.garbage = o.garbage[1:]
 		}
-		// The stream is reopened reopenRewind bytes before the error
-		// but not before where it was opened
-		o.wantStart += max(N+G-reopenRewind, 0)
+		// The stream is reopened rewind bytes before the error but
+		// not before where it was opened
+		o.wantStart += max(N+G-o.rewind, 0)
 		// If 0 then return an error immediately
 		if N == 0 {
 			return nil, errorTestError
@@ -101,7 +113,7 @@ func (o *reOpenTestObject) Open(ctx context.Context, options ...fs.OpenOption) (
 }
 
 func TestReOpen(t *testing.T) {
-	for _, testName := range []string{"Normal", "WithRangeOption", "WithSeekOption", "UnknownSize"} {
+	for _, testName := range []string{"Normal", "NoRewind", "WithRangeOption", "WithSeekOption", "UnknownSize"} {
 		t.Run(testName, func(t *testing.T) {
 			// Contents for the mock object
 			var (
@@ -110,9 +122,12 @@ func TestReOpen(t *testing.T) {
 				rangeOption        *fs.RangeOption
 				seekOption         *fs.SeekOption
 				unknownSize        = false
+				rewind             = int64(testRewind)
 			)
 			switch testName {
 			case "Normal":
+			case "NoRewind":
+				rewind = 0
 			case "WithRangeOption":
 				rangeOption = &fs.RangeOption{Start: 1, End: 7} // range is inclusive
 				expectedRead = reOpenTestcontents[1:8]
@@ -134,6 +149,7 @@ func TestReOpen(t *testing.T) {
 				src := &reOpenTestObject{
 					Object:      srcOrig,
 					t:           t,
+					rewind:      rewind,
 					breaks:      breaks,
 					unknownSize: unknownSize,
 				}
@@ -149,7 +165,7 @@ func TestReOpen(t *testing.T) {
 					opts = append(opts, seekOption)
 					src.wantStart = seekOption.Offset
 				}
-				rc, err := NewReOpen(context.Background(), src, maxRetries, opts...)
+				rc, err := NewReOpen(rewindContext(rewind), src, maxRetries, opts...)
 				return rc, src, err
 			}
 
@@ -226,11 +242,15 @@ func TestReOpen(t *testing.T) {
 				h, _, err := testReOpen([]int64{2, 1, 3}, 3)
 				assert.NoError(t, err)
 
-				// check contents - the data read before each error is
-				// discarded in case it is garbage
+				// check contents - with a rewind the data read before
+				// each error is discarded in case it is garbage
 				got, err := io.ReadAll(h)
 				assert.Equal(t, errorTestError, err)
-				assert.Equal(t, expectedRead[:0], got)
+				if rewind == 0 {
+					assert.Equal(t, expectedRead[:6], got)
+				} else {
+					assert.Equal(t, expectedRead[:0], got)
+				}
 
 				// check old error is returned
 				var buf = make([]byte, 1)
@@ -464,10 +484,10 @@ func readReOpenInChunks(t *testing.T, h *ReOpen, bufSize int) []byte {
 }
 
 // Check garbage sent just before the stream breaks is discarded and
-// the stream reopened reopenRewind bytes before the break, whatever
+// the stream reopened testRewind bytes before the break, whatever
 // size of buffer the data is read with.
 func TestReOpenGarbage(t *testing.T) {
-	contents := []byte(random.String(3*reopenRewind + 123))
+	contents := []byte(random.String(3*testRewind + 123))
 	for _, test := range []struct {
 		name    string
 		breaks  []int64
@@ -475,15 +495,16 @@ func TestReOpenGarbage(t *testing.T) {
 		rng     *fs.RangeOption
 	}{
 		{name: "NoGarbage", breaks: []int64{5000, 100, 6000}},
-		{name: "MaxGarbage", breaks: []int64{5000, 100, 6000}, garbage: []int64{reopenRewind, reopenRewind, reopenRewind}},
+		{name: "MaxGarbage", breaks: []int64{5000, 100, 6000}, garbage: []int64{testRewind, testRewind, testRewind}},
 		{name: "SomeGarbage", breaks: []int64{5000, 100, 6000, 500}, garbage: []int64{1, 50, 4000, 0}},
-		{name: "RangeGarbage", breaks: []int64{5000, 100}, garbage: []int64{reopenRewind, 50}, rng: &fs.RangeOption{Start: 1000, End: int64(len(contents)) - 1001}},
+		{name: "RangeGarbage", breaks: []int64{5000, 100}, garbage: []int64{testRewind, 50}, rng: &fs.RangeOption{Start: 1000, End: int64(len(contents)) - 1001}},
 	} {
-		for _, bufSize := range []int{1, 100, reopenRewind, 2 * len(contents)} {
+		for _, bufSize := range []int{1, 100, testRewind, 2 * len(contents)} {
 			t.Run(fmt.Sprintf("%s/%d", test.name, bufSize), func(t *testing.T) {
 				src := &reOpenTestObject{
 					Object:  mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
 					t:       t,
+					rewind:  testRewind,
 					breaks:  slices.Clone(test.breaks),
 					garbage: slices.Clone(test.garbage),
 				}
@@ -495,7 +516,7 @@ func TestReOpenGarbage(t *testing.T) {
 					src.wantStart = test.rng.Start
 					want = contents[test.rng.Start : test.rng.End+1]
 				}
-				h, err := NewReOpen(context.Background(), src, 10, opts...)
+				h, err := NewReOpen(rewindContext(testRewind), src, 10, opts...)
 				require.NoError(t, err)
 				got := readReOpenInChunks(t, h, bufSize)
 				assert.Equal(t, want, got)
@@ -505,20 +526,21 @@ func TestReOpenGarbage(t *testing.T) {
 		}
 	}
 
-	// Check only the data more than reopenRewind bytes before the
+	// Check only the data more than testRewind bytes before the
 	// break is returned when the retries run out
 	t.Run("TooManyErrors", func(t *testing.T) {
 		src := &reOpenTestObject{
 			Object:  mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
 			t:       t,
+			rewind:  testRewind,
 			breaks:  []int64{5000},
 			garbage: []int64{100},
 		}
-		h, err := NewReOpen(context.Background(), src, 1)
+		h, err := NewReOpen(rewindContext(testRewind), src, 1)
 		require.NoError(t, err)
 		got, err := io.ReadAll(h)
 		assert.Equal(t, errorTestError, err)
-		assert.Equal(t, contents[:5100-reopenRewind], got)
+		assert.Equal(t, contents[:5100-testRewind], got)
 	})
 
 	// Check an error after all the data has been read is returned
@@ -527,12 +549,30 @@ func TestReOpenGarbage(t *testing.T) {
 		src := &reOpenTestObject{
 			Object: mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
 			t:      t,
+			rewind: testRewind,
 			breaks: []int64{int64(len(contents))},
 		}
-		h, err := NewReOpen(context.Background(), src, 10)
+		h, err := NewReOpen(rewindContext(testRewind), src, 10)
 		require.NoError(t, err)
 		got, err := io.ReadAll(h)
 		assert.Equal(t, errorTestError, err)
 		assert.Equal(t, contents[:len(got)], got)
+	})
+
+	// Check that without a rewind the stream is reopened where it
+	// broke so any garbage is returned
+	t.Run("NoRewind", func(t *testing.T) {
+		src := &reOpenTestObject{
+			Object:  mockobject.New("potato").WithContent(contents, mockobject.SeekModeNone),
+			t:       t,
+			breaks:  []int64{5000},
+			garbage: []int64{100},
+		}
+		h, err := NewReOpen(rewindContext(0), src, 10)
+		require.NoError(t, err)
+		got, err := io.ReadAll(h)
+		require.NoError(t, err)
+		want := slices.Concat(contents[:5000], bytes.Repeat([]byte{0xFF}, 100), contents[5100:])
+		assert.Equal(t, want, got)
 	})
 }

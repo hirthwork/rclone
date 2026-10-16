@@ -10,9 +10,6 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 )
 
-// Number of bytes to discard from the end of the last chunk if stream breaks.
-const reopenRewind = 4 * 1024
-
 // AccountFn is a function which will be called after every read
 // from the ReOpen.
 //
@@ -72,7 +69,7 @@ func NewReOpen(ctx context.Context, src fs.Object, maxTries int, options ...fs.O
 		start:       0,
 		offset:      0,
 		newOffset:   -1, // -1 means no seek required
-		held:        make([]byte, 0, reopenRewind),
+		held:        make([]byte, 0, max(fs.GetConfig(ctx).DownloadRewind, 0)),
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -222,14 +219,14 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 	h.offset += int64(n)
 
 	// Read a full buffer
-	for err == nil && (n < len(p) || len(h.held) < reopenRewind) {
+	for err == nil && (n < len(p) || len(h.held) < cap(h.held)) {
 		var nn int
 		if n < len(p) {
 			nn, err = h.rc.Read(p[n:])
 			n += nn
 			h.offset += int64(nn)
 		} else {
-			nn, err = h.rc.Read(h.held[len(h.held):reopenRewind])
+			nn, err = h.rc.Read(h.held[len(h.held):cap(h.held)])
 			h.held = h.held[:len(h.held)+nn]
 		}
 		h.streamRead += int64(nn)
@@ -240,7 +237,7 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 				// Discard the end of the broken stream as it may be garbage.
 				// h.held must be discarded completely.
 				// Tail of p must be discarded as well.
-				discard := int(min(h.streamRead, reopenRewind, int64(n+len(h.held))))
+				discard := int(min(h.streamRead, int64(cap(h.held)), int64(n+len(h.held))))
 				fs.DebugfCtx(h.ctx, h.src, "Reopening on read failure after offset %d bytes discarding the last %d bytes: retry %d/%d: %v", readTo, discard, h.tries, h.maxTries, err)
 				fromP := discard - len(h.held)
 				n -= fromP

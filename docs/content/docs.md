@@ -1495,6 +1495,25 @@ This stops rclone from trying to use HTTP/2 if available. This can
 sometimes speed up transfers due to a
 [problem in the Go standard library](https://github.com/golang/go/issues/37373).
 
+### --download-rewind SizeSuffix
+
+When a download is interrupted rclone resumes it from where it got to
+with a low level retry (see `--low-level-retries`). Some faulty
+servers write garbage to the connection just before dropping it,
+which would then end up in the downloaded data.
+
+Setting this makes rclone hold back the last `--download-rewind`
+bytes of every download and only return them once more data has
+arrived. If the connection breaks they are discarded and the download
+resumes that many bytes earlier, so up to that much garbage is never
+returned. For example `--download-rewind 4k` copes with a server
+which writes up to 4 KiB of garbage. The default of 0 disables this.
+
+Note that a retry then only makes progress if the connection delivers
+more than `--download-rewind` bytes, and that the last
+`--download-rewind` bytes read before a failure which exhausts the
+retries are not returned.
+
 ### --dscp string
 
 Specify a DSCP value or name to use in connections. This could help QoS
